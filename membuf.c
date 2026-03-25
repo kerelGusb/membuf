@@ -26,6 +26,8 @@ struct membuf_device {
     size_t buf_size;
     size_t data_size;
     struct mutex buf_lock;
+    int open_count;
+    struct mutex open_count_lock;
 };
 
 static dev_t base_dev;
@@ -33,9 +35,11 @@ static struct class *membuf_class;
 
 static struct file_operations fops;
 
+
 #define MAX_DEVICES 128
 
 static struct membuf_device devices[MAX_DEVICES];
+static bool module_initialized = false;
 
 // Module parameters configuration
 static int DEVICE_NUM = 3;
@@ -45,81 +49,110 @@ static int INITIAL_BUF_SIZE = 1024;
 static int set_device_num(const char *val, const struct kernel_param *kp)
 {
     int new_num, i, ret = 0;
-    if (kstrtoint(val, 10, &new_num) < 0 || new_num <= 0  || new_num > MAX_DEVICES)
+    int buffers_created = 0;
+    int devices_created = 0;
+    int cdevs_added = 0;
+    
+    if (kstrtoint(val, 10, &new_num) < 0 || new_num <= 0 || new_num > MAX_DEVICES)
     {
         pr_err("membuf: invalid device number parameter\n");
         return -EINVAL;
     }
-
+    
     down_write(&devices_lock);
 
-    int old_num = DEVICE_NUM;
-    
-    if (new_num < old_num) {
-        for (i = new_num; i < old_num; i++) {
-            kfree(devices[i].buffer);
-            device_destroy(membuf_class, devices[i].devnum);
-            cdev_del(&devices[i].membuf_cdev);
-
-            devices[i].buffer = NULL;
-        }
-    }
-    if (new_num > old_num) {
-        for (i = old_num; i < new_num; i++) {
-
-            devices[i].devnum = MKDEV(MAJOR(base_dev), MINOR(base_dev) + i);
-
-            cdev_init(&devices[i].membuf_cdev, &fops);
-            devices[i].membuf_cdev.owner = THIS_MODULE;
-
-            ret = cdev_add(&devices[i].membuf_cdev, devices[i].devnum, 1);
-            if (ret) {
-                pr_err("membuf: cdev_add failed for device %d\n", i);
-                goto err_new;
+    // If DEVICE_NUM set before initialization, this code will throw an
+    // error. So if this happens, we just changing DEVICE_NUM and do nothing.
+    if (module_initialized) {
+        if (new_num < DEVICE_NUM) {
+            for (i = new_num; i < DEVICE_NUM; i++) {
+                mutex_lock(&devices[i].open_count_lock);
+                if (devices[i].open_count > 0) {
+                    mutex_unlock(&devices[i].open_count_lock);
+                    pr_err("membuf: device %d is busy\n", i);
+                    ret = -EBUSY;
+                    goto out;
+                }
+                mutex_unlock(&devices[i].open_count_lock);
             }
-
-            devices[i].memdev = device_create(membuf_class, NULL,
-                                              devices[i].devnum, NULL,
-                                              DEVICE_NAME "%d", i);
-            if (IS_ERR(devices[i].memdev)) {
-                pr_err("membuf: device_create failed for device %d\n", i);
-                cdev_del(&devices[i].membuf_cdev);
-                ret = PTR_ERR(devices[i].memdev);
-                goto err_new;
-            }
-
-            mutex_init(&devices[i].buf_lock);
-
-            devices[i].buffer = kzalloc(INITIAL_BUF_SIZE, GFP_KERNEL);
-            if (!devices[i].buffer) {
+            for (i = new_num; i < DEVICE_NUM; i++) {
+                kfree(devices[i].buffer);
                 device_destroy(membuf_class, devices[i].devnum);
                 cdev_del(&devices[i].membuf_cdev);
-                ret = -ENOMEM;
-                goto err_new;
             }
-
-            devices[i].buf_size = INITIAL_BUF_SIZE;
-            devices[i].data_size = 0;
         }
-    }
+        if (new_num > DEVICE_NUM) {
+            for (i = DEVICE_NUM; i < new_num; i++) {
 
-    DEVICE_NUM = new_num;
-    *(int *)kp->arg = new_num;
+                devices[i].devnum = MKDEV(MAJOR(base_dev), MINOR(base_dev) + i);
 
-    up_write(&devices_lock);
+                cdev_init(&devices[i].membuf_cdev, &fops);
+                devices[i].membuf_cdev.owner = THIS_MODULE;
 
-    pr_info("membuf: device number set to %d\n", new_num);
-    return 0;
+                
+                if (ret = cdev_add(&devices[i].membuf_cdev, devices[i].devnum, 1)) {
+                    pr_err("membuf: cdev_add failed for device %d\n", i);
+                    goto err_cdev_del;
+                }
+                cdevs_added++;
 
-err_new:
-    for (--i; i >= old_num; i--) {
-        kfree(devices[i].buffer);
-        if (!IS_ERR_OR_NULL(devices[i].memdev))
+                devices[i].memdev = device_create(membuf_class, NULL, devices[i].devnum, NULL, DEVICE_NAME "%d", i);
+                mutex_init(&devices[i].buf_lock);
+                mutex_init(&devices[i].open_count_lock);
+
+                if (IS_ERR(devices[i].memdev)) {
+                    pr_err("membuf: device_create failed for device %d\n", i);
+                    cdev_del(&devices[i].membuf_cdev);
+                    ret = PTR_ERR(devices[i].memdev);
+                    goto err_device_destroy;
+                }
+                devices_created++;
+
+
+                devices[i].buffer = kzalloc(INITIAL_BUF_SIZE, GFP_KERNEL);
+                if (!devices[i].buffer) {
+                    pr_err("membuf: failed to allocate buffer for device %d\n", i);
+                    ret = -ENOMEM;
+                    goto err_alloc_fail;
+                }
+
+                devices[i].buf_size = INITIAL_BUF_SIZE;
+                devices[i].data_size = 0;
+                devices[i].open_count = 0;
+                buffers_created++;
+            }
+        }
+
+
+        *(int *)kp->arg = new_num;
+        up_write(&devices_lock);
+        pr_info("membuf: device number set to %d\n", new_num);
+        return 0;
+
+
+err_alloc_fail:
+        for (i = 0; i < buffers_created; ++i) {
+            kfree(devices[i].buffer);
+        }
+
+err_device_destroy:
+        for (i = 0; i < devices_created; ++i) {
             device_destroy(membuf_class, devices[i].devnum);
-        cdev_del(&devices[i].membuf_cdev);
+        }
+        class_destroy(membuf_class);
+
+err_cdev_del:
+        for (i = 0; i < cdevs_added; ++i) {
+            cdev_del(&devices[i].membuf_cdev);
+        }
+    } else {
+        *(int *)kp->arg = new_num;
+        pr_info("membuf: device number set to %d\n", new_num);
     }
 
+out:
     up_write(&devices_lock);
+
     return ret;
 }
 
@@ -216,6 +249,10 @@ static int membuf_open(struct inode *inode, struct file *file)
         return -ENODEV;
     }
 
+    mutex_lock(&devices[minor].open_count_lock);
+    devices[minor].open_count++;
+    mutex_unlock(&devices[minor].open_count_lock);
+
     file->private_data = &devices[minor];
 
     pr_info("membuf: opened by process %d (%s)\n", 
@@ -229,6 +266,12 @@ static int membuf_open(struct inode *inode, struct file *file)
 
 static int membuf_release(struct inode *inode, struct file *file)
 {
+    struct membuf_device *dev = file->private_data;
+
+    mutex_lock(&dev->open_count_lock);
+    dev->open_count--;
+    mutex_unlock(&dev->open_count_lock);
+    
     pr_info("membuf: closed by process %d (%s)\n", 
             current->pid, current->comm);
 
@@ -399,6 +442,7 @@ static int membuf_uevent(const struct device *dev, struct kobj_uevent_env *env)
 static int __init membuf_init(void)
 {
     int ret, i;
+    int buffers_created = 0;
     int devices_created = 0;
     int cdevs_added = 0;
 
@@ -433,6 +477,7 @@ static int __init membuf_init(void)
     for (i = 0; i < DEVICE_NUM; ++i) {
         devices[i].memdev = device_create(membuf_class, NULL, devices[i].devnum, NULL, DEVICE_NAME "%d", i);
         mutex_init(&devices[i].buf_lock);
+        mutex_init(&devices[i].open_count_lock);
 
         if (IS_ERR(devices[i].memdev)) {
             pr_err("membuf: device_create failed for device %d\n", i);
@@ -447,15 +492,23 @@ static int __init membuf_init(void)
         if (!devices[i].buffer) {
             pr_err("membuf: failed to allocate buffer for device %d\n", i);
             ret = -ENOMEM;
-            goto err_device_destroy;
+            goto err_alloc_fail;
         }
         devices[i].buf_size = INITIAL_BUF_SIZE;
         devices[i].data_size = 0;
+        devices[i].open_count = 0;
+        buffers_created++;
     }
+
+    module_initialized = true;
 
     pr_info("membuf: module loaded\n");
     return 0;
 
+err_alloc_fail:
+    for (i = 0; i < buffers_created; ++i) {
+        kfree(devices[i].buffer);
+    }
 
 err_device_destroy:
     for (i = 0; i < devices_created; ++i) {
@@ -467,9 +520,7 @@ err_cdev_del:
     for (i = 0; i < cdevs_added; ++i) {
         cdev_del(&devices[i].membuf_cdev);
     }
-    kfree(devices);
 
-err_unregister:
     unregister_chrdev_region(base_dev, DEVICE_NUM);
     return ret;
 }
