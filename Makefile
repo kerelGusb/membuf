@@ -1,4 +1,5 @@
 obj-m += membuf.o
+membuf-objs := src/membuf.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
@@ -12,8 +13,8 @@ module:
 
 test: $(TEST)
 
-$(TEST): test_membuf.c
-	gcc -pthread -o $(TEST) test_membuf.c
+$(TEST): src/test_membuf.c
+	gcc -pthread -o $(TEST) src/test_membuf.c
 
 clean:
 	make -C $(KDIR) M=$(PWD) clean
