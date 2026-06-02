@@ -1,0 +1,1 @@
+KERNEL=="membuf*", MODE="0600"
